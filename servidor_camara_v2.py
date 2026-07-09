@@ -253,29 +253,15 @@ class FuenteOWON:
         log_fuente.info("Fuente conectada: %s (bus=%d address=%d)",
                         self.etiqueta, dev.bus, dev.address)
 
-        # Intentar desbloquear el panel frontal (REMOTE mode).
-        # La ODP3032 puede entrar en modo remoto al recibir comandos USB,
-        # lo que congela los botones físicos. KEYLOCK,0 lo libera (si el
-        # firmware lo soporta; si no, la excepción se ignora).
-        log_fuente.info("Intentando desbloquear panel frontal (KEYLOCK,0)…")
-        try:
-            self.enviar("KEYLOCK,0")
-            log_fuente.info("Panel frontal desbloqueado (KEYLOCK,0 aceptado)")
-        except Exception as e:
-            log_fuente.warning(
-                "KEYLOCK,0 no aceptado (%s) — el panel frontal puede quedar "
-                "bloqueado en REMOTE mode mientras haya conexión USB activa", e
-            )
+        # No enviar KEYLOCK automáticamente. En esta familia el significado
+        # cambia entre revisiones de firmware y, además, una escritura sin leer
+        # su ACK no permite afirmar que el panel haya quedado desbloqueado.
+        # El panel puede permanecer en REMOTE mientras haya tráfico USB; eso es
+        # independiente del lock interno que serializa los comandos del driver.
 
     def desconectar(self):
         if self._dev is not None:
             log_fuente.info("Desconectando fuente (%s)", self.etiqueta)
-            # Intentar restaurar el control local antes de soltar el USB.
-            try:
-                self.enviar("KEYLOCK,0")
-                log_fuente.info("Panel frontal restaurado (KEYLOCK,0)")
-            except Exception:
-                pass
             try:
                 usb.util.release_interface(self._dev, 0)
             except Exception:
@@ -298,9 +284,9 @@ class FuenteOWON:
     def enviar(self, payload, leer=False):
         """Envía &payload,checksum# y opcionalmente lee la respuesta.
 
-        El threading.Lock se suelta antes del sleep en comandos write-only,
-        para que el lazo PID no bloquee las peticiones de la API durante
-        los ~100 ms de espera del dispositivo.
+        Incluso los comandos write-only devuelven un $ACK. Es indispensable
+        consumirlo: si se dejan ACK pendientes, el endpoint IN se llena y la
+        fuente termina aparentando estar bloqueada.
         """
         if not self.conectada:
             raise RuntimeError("La fuente no está conectada")
@@ -308,17 +294,22 @@ class FuenteOWON:
         log_fuente.debug("TX → %s", trama.decode(errors="replace").strip())
         with self._lock:
             self._dev.write(EP_OUT, trama)
-            if leer:
-                # Mantener el lock durante el sleep para que otro write
-                # no corrompa nuestra respuesta pendiente.
-                time.sleep(0.12)
-                datos = self._dev.read(EP_IN, 512, timeout=5000)
-                self.ultima_respuesta = ''.join(chr(x) for x in datos).strip()
-                log_fuente.debug("RX ← %s", self.ultima_respuesta)
-                return self.ultima_respuesta
-        # Write-only: soltar el lock ANTES del sleep para no bloquear otros hilos.
-        time.sleep(0.05)
-        return None
+            # Mantener el lock hasta asociar la respuesta con este comando.
+            time.sleep(0.12 if leer else 0.05)
+            try:
+                datos = self._dev.read(
+                    EP_IN, 512, timeout=5000 if leer else 250
+                )
+                respuesta = ''.join(chr(x) for x in datos).strip()
+                self.ultima_respuesta = respuesta
+                log_fuente.debug("RX ← %s", respuesta)
+                return respuesta if leer else None
+            except usb.core.USBTimeoutError:
+                if leer:
+                    raise
+                # Algunos firmwares no confirman todos los setters.
+                log_fuente.debug("Sin ACK para %s (continuando)", payload)
+                return None
 
     # ---- Comandos de la especificación (ODP3032.txt) ----
 
@@ -383,7 +374,9 @@ class FuenteOWON:
 
             def _ch(off):
                 return {
-                    "on":    int(p[off]),
+                    # En SYNCHRO usa la misma lógica invertida que SW:
+                    # 0 = salida activa, 1 = salida desactivada.
+                    "on":    int(p[off]) == 0,
                     "cc_cv": int(p[off + 1]),   # 0 = CV (voltaje), 1 = CC (corriente)
                     "f3":    int(p[off + 2]),
                     "v_set": float(p[off + 3]),
@@ -583,7 +576,7 @@ def _rampa(v_actual, v_deseado, dt):
 def lazo_control():
     ultimo = time.time()
     ultimo_synchro = 0.0
-    ultimo_keylock = 0.0   # para enviar KEYLOCK,0 periódicamente
+    ultimo_diag = 0.0
     while True:
         time.sleep(PERIODO_CONTROL)
         ahora = time.time()
@@ -638,16 +631,9 @@ def lazo_control():
                 time.sleep(0.15)
                 fuente.sincronizar()
 
-            # --- KEYLOCK periódico: mantener panel frontal desbloqueado ---
-            # Algunos firmwares de OWON vuelven a REMOTE mode con el tiempo.
-            if ahora - ultimo_keylock > 30.0 and fuente.conectada:
-                ultimo_keylock = ahora
-                try:
-                    fuente.enviar("KEYLOCK,0")
-                    log_fuente.debug("KEYLOCK,0 periódico enviado")
-                except Exception as e:
-                    log_fuente.debug("KEYLOCK,0 periódico falló: %s", e)
-                # Diagnóstico: verificar estado real de la fuente
+            # --- Diagnóstico periódico del estado real de la fuente ---
+            if fuente.canales and ahora - ultimo_diag > 10.0:
+                ultimo_diag = ahora
                 for canal, zona, v_cmd in [
                     (CANAL_FRIO,     "FRÍO",  estado.v_cold),
                     (CANAL_CALIENTE, "CALOR", estado.v_hot),
