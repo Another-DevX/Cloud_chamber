@@ -26,10 +26,29 @@ del laboratorio.
 """
 
 import json
+import logging
 import math
 import threading
 import time
 from collections import deque
+
+# ============================================================================
+# Logging
+# ============================================================================
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("cloud_chamber.log", encoding="utf-8"),
+    ],
+)
+log = logging.getLogger("cloud_chamber")
+log_fuente = logging.getLogger("cloud_chamber.fuente")
+log_esp32  = logging.getLogger("cloud_chamber.esp32")
+log_pid    = logging.getLogger("cloud_chamber.pid")
 
 import serial                       # solo para el ESP32 (CDC/serie)
 import serial.tools.list_ports
@@ -159,21 +178,26 @@ class FuenteOWON:
         `ident` es "bus.address" (lo que manda la interfaz). Si viene vacío,
         se busca por VID/PID como en el script original.
         """
+        log_fuente.info("Intentando conectar fuente OWON (ident=%s)", ident or "auto")
         self.desconectar()
 
         if ident and "." in ident:
             bus, addr = (int(x) for x in ident.split("."))
             dev = usb.core.find(custom_match=lambda d: d.bus == bus and d.address == addr)
+            log_fuente.debug("Buscando por bus=%d address=%d", bus, addr)
         else:
             dev = usb.core.find(idVendor=OWON_VID, idProduct=OWON_PID)
+            log_fuente.debug("Buscando por VID=0x%04x PID=0x%04x", OWON_VID, OWON_PID)
 
         if dev is None:
+            log_fuente.error("No se encontró la fuente OWON en el bus USB")
             raise RuntimeError("No se encontró la fuente OWON. Verifica el cable USB.")
 
         # En Linux puede haber un driver del kernel tomado; lo soltamos.
         # En Windows esto no aplica y lanza excepción, así que lo ignoramos.
         try:
             if dev.is_kernel_driver_active(0):
+                log_fuente.debug("Soltando driver del kernel para interfaz 0")
                 dev.detach_kernel_driver(0)
         except Exception:
             pass
@@ -186,9 +210,12 @@ class FuenteOWON:
 
         self._dev = dev
         self.etiqueta = f"{dev.idVendor:04x}:{dev.idProduct:04x}"
+        log_fuente.info("Fuente conectada: %s (bus=%d address=%d)",
+                        self.etiqueta, dev.bus, dev.address)
 
     def desconectar(self):
         if self._dev is not None:
+            log_fuente.info("Desconectando fuente (%s)", self.etiqueta)
             try:
                 usb.util.dispose_resources(self._dev)
             except Exception:
@@ -208,12 +235,15 @@ class FuenteOWON:
         """Envía &payload,checksum# y opcionalmente lee la respuesta."""
         if not self.conectada:
             raise RuntimeError("La fuente no está conectada")
+        trama = self._enmarcar(payload)
+        log_fuente.debug("TX → %s", trama.decode(errors="replace").strip())
         with self._lock:
-            self._dev.write(EP_OUT, self._enmarcar(payload))
+            self._dev.write(EP_OUT, trama)
             time.sleep(0.1)
             if leer:
                 datos = self._dev.read(EP_IN, 512, timeout=5000)
                 self.ultima_respuesta = ''.join(chr(x) for x in datos).strip()
+                log_fuente.debug("RX ← %s", self.ultima_respuesta)
                 return self.ultima_respuesta
         return None
 
@@ -221,14 +251,17 @@ class FuenteOWON:
 
     def salida(self, canal, encendida):
         # SW{CH},{0,1}: 0 activa, 1 desactiva (¡ojo, está invertido!)
+        log_fuente.info("Salida CH%d → %s", canal, "ON" if encendida else "OFF")
         self.enviar(f"SW{canal},{0 if encendida else 1}")
 
     def set_voltaje(self, canal, voltios):
         voltios = max(0.0, min(V_MAX_HW, voltios))
+        log_fuente.debug("set_voltaje CH%d → %.2f V", canal, voltios)
         self.enviar(f"SCH{canal}V,{voltios:.2f}")
 
     def set_corriente(self, canal, amperios):
         amperios = max(0.0, min(I_MAX_HW, amperios))
+        log_fuente.info("set_corriente CH%d → %.2f A", canal, amperios)
         self.enviar(f"SCH{canal}C,{amperios:.2f}")
 
     def sincronizar(self):
@@ -259,14 +292,18 @@ class LectorESP32:
         return self._ser is not None and self._ser.is_open
 
     def conectar(self, puerto, baudios=115200):
+        log_esp32.info("Conectando ESP32 en %s a %d baudios", puerto, baudios)
         self.desconectar()
         self._ser = serial.Serial(puerto, baudios, timeout=2)
         self.puerto = puerto
+        log_esp32.info("ESP32 conectado en %s", puerto)
         self._detener.clear()
         self._hilo = threading.Thread(target=self._bucle, daemon=True)
         self._hilo.start()
 
     def desconectar(self):
+        if self._ser is not None:
+            log_esp32.info("Desconectando ESP32 (%s)", self.puerto)
         self._detener.set()
         if self._hilo is not None:
             self._hilo.join(timeout=3)
@@ -280,11 +317,13 @@ class LectorESP32:
         self.puerto = None
 
     def _bucle(self):
+        log_esp32.debug("Hilo de lectura ESP32 iniciado")
         while not self._detener.is_set():
             try:
                 linea = self._ser.readline().decode(errors="replace").strip()
-            except Exception:
+            except Exception as exc:
                 # El puerto se cayó (desconectaron el cable, etc.)
+                log_esp32.error("Error leyendo del ESP32: %s", exc)
                 self.estado.registrar_error("Se perdió la conexión con el ESP32")
                 break
             if not linea:
@@ -292,9 +331,11 @@ class LectorESP32:
             try:
                 dato = json.loads(linea)
             except json.JSONDecodeError:
+                log_esp32.warning("Línea no parseable del ESP32: %r", linea)
                 continue  # línea corrupta, ignorar
             t_cold = dato.get("t_cold")
             t_hot = dato.get("t_hot")
+            log_esp32.debug("Muestra recibida: t_cold=%s °C  t_hot=%s °C", t_cold, t_hot)
             self.estado.nueva_muestra(t_cold, t_hot)
 
 
@@ -383,6 +424,10 @@ lector = LectorESP32(estado)
 
 def apagar_salidas(motivo=None):
     """Pone ambos canales a 0 V y apaga las salidas. Nunca lanza excepción."""
+    if motivo:
+        log_pid.warning("apagar_salidas: %s", motivo)
+    else:
+        log_pid.info("apagar_salidas llamado")
     estado.pid_cold_on = False
     estado.pid_hot_on = False
     estado.pid_cold.reset()
@@ -425,11 +470,14 @@ def lazo_control():
 
         # --- Watchdog: datos de temperatura frescos ---
         if pid_activo and (ahora - estado.t_dato) > WATCHDOG_S:
+            log_pid.warning("Watchdog disparado: última muestra hace %.1f s",
+                            ahora - estado.t_dato)
             apagar_salidas("WATCHDOG: sin datos de temperatura, salidas apagadas")
             continue
 
         if not fuente.conectada:
             if pid_activo:
+                log_pid.error("Fuente desconectada con PID activo; desactivando PID")
                 estado.pid_cold_on = False
                 estado.pid_hot_on = False
                 estado.registrar_error("La fuente se desconectó; PID desactivado")
@@ -442,6 +490,8 @@ def lazo_control():
                 err = estado.t_cold - estado.sp_cold
                 v = estado.pid_cold.update(err, estado.t_cold, dt)
                 v = _rampa(estado.v_cold, v, dt)
+                log_pid.debug("PID FRÍO  t=%.2f°C sp=%.2f°C err=%+.2f v_ramp=%.3f V",
+                              estado.t_cold, estado.sp_cold, err, v)
                 estado.v_cold = v
                 fuente.set_voltaje(CANAL_FRIO, v)
 
@@ -451,15 +501,19 @@ def lazo_control():
                 err = estado.sp_hot - estado.t_hot
                 v = estado.pid_hot.update(err, estado.t_hot, dt)
                 v = _rampa(estado.v_hot, v, dt)
+                log_pid.debug("PID CALOR t=%.2f°C sp=%.2f°C err=%+.2f v_ramp=%.3f V",
+                              estado.t_hot, estado.sp_hot, err, v)
                 estado.v_hot = v
                 fuente.set_voltaje(CANAL_CALIENTE, v)
 
             # --- Consulta periódica de la fuente (cruda, ver nota en driver)
             if ahora - ultimo_synchro > 10.0:
                 ultimo_synchro = ahora
-                fuente.sincronizar()
+                resp = fuente.sincronizar()
+                log_fuente.info("SYNCHRO → %s", resp)
 
         except Exception as e:
+            log_pid.exception("Excepción en el lazo de control")
             apagar_salidas(f"Error comunicándose con la fuente: {e}")
 
 
@@ -515,6 +569,7 @@ def api_conectar():
     dispositivo = datos.get("dispositivo")
     puerto = datos.get("puerto")
     baudios = int(datos.get("baudios", 115200))
+    log.info("API /conectar — dispositivo=%s puerto=%s", dispositivo, puerto)
     try:
         if dispositivo == "esp32":
             lector.conectar(puerto, baudios)
@@ -526,9 +581,13 @@ def api_conectar():
             fuente.set_voltaje(CANAL_CALIENTE, 0.0)
             fuente.set_corriente(CANAL_FRIO, estado.i_lim_cold)
             fuente.set_corriente(CANAL_CALIENTE, estado.i_lim_hot)
+            log.info("Fuente inicializada con i_lim_cold=%.2f A  i_lim_hot=%.2f A",
+                     estado.i_lim_cold, estado.i_lim_hot)
         else:
+            log.warning("API /conectar — dispositivo desconocido: %s", dispositivo)
             return jsonify({"ok": False, "error": "dispositivo desconocido"}), 400
     except Exception as e:
+        log.exception("Error al conectar %s", dispositivo)
         return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify({"ok": True})
 
@@ -537,6 +596,7 @@ def api_conectar():
 def api_desconectar():
     datos = request.get_json(force=True)
     dispositivo = datos.get("dispositivo")
+    log.info("API /desconectar — dispositivo=%s", dispositivo)
     if dispositivo == "esp32":
         lector.desconectar()
     elif dispositivo == "fuente":
@@ -551,8 +611,10 @@ def api_setpoints():
     with estado.lock:
         if "cold" in datos:
             estado.sp_cold = float(datos["cold"])
+            log.info("Setpoint FRÍO → %.2f°C", estado.sp_cold)
         if "hot" in datos:
             estado.sp_hot = float(datos["hot"])
+            log.info("Setpoint CALOR → %.2f°C", estado.sp_hot)
     return jsonify({"ok": True})
 
 
@@ -565,11 +627,15 @@ def api_pid():
 
     for campo in ("kp", "ki", "kd"):
         if campo in datos:
-            setattr(pid, campo, float(datos[campo]))
+            nuevo = float(datos[campo])
+            log_pid.info("PID %s: %s = %.4f", zona.upper(), campo, nuevo)
+            setattr(pid, campo, nuevo)
     if "vmax" in datos:
         pid.out_max = max(0.0, min(V_MAX_HW, float(datos["vmax"])))
+        log_pid.info("PID %s: vmax = %.2f V", zona.upper(), pid.out_max)
     if "imax" in datos:
         imax = max(0.0, min(I_MAX_HW, float(datos["imax"])))
+        log_pid.info("PID %s: imax = %.2f A", zona.upper(), imax)
         if zona == "cold":
             estado.i_lim_cold = imax
         else:
@@ -581,10 +647,13 @@ def api_pid():
     if "activo" in datos:
         activo = bool(datos["activo"])
         canal = CANAL_FRIO if zona == "cold" else CANAL_CALIENTE
+        log_pid.info("PID %s: solicitud activo=%s", zona.upper(), activo)
         if activo:
             if not fuente.conectada:
+                log_pid.warning("PID %s: no se puede activar, fuente no conectada", zona.upper())
                 return jsonify({"ok": False, "error": "Conecta la fuente primero"}), 400
             if (time.time() - estado.t_dato) > WATCHDOG_S:
+                log_pid.warning("PID %s: no se puede activar, sin datos de temperatura", zona.upper())
                 return jsonify({"ok": False,
                                 "error": "No hay datos de temperatura recientes"}), 400
             pid.reset()
@@ -592,6 +661,7 @@ def api_pid():
                 fuente.set_voltaje(canal, 0.0)
                 fuente.salida(canal, True)
             except Exception as e:
+                log_pid.exception("Error activando PID %s", zona.upper())
                 return jsonify({"ok": False, "error": str(e)}), 500
             if zona == "cold":
                 estado.v_cold = 0.0
@@ -599,6 +669,7 @@ def api_pid():
             else:
                 estado.v_hot = 0.0
                 estado.pid_hot_on = True
+            log_pid.info("PID %s activado", zona.upper())
         else:
             if zona == "cold":
                 estado.pid_cold_on = False
@@ -611,12 +682,15 @@ def api_pid():
                     fuente.set_voltaje(canal, 0.0)
                     fuente.salida(canal, False)
                 except Exception as e:
+                    log_pid.exception("Error desactivando PID %s", zona.upper())
                     return jsonify({"ok": False, "error": str(e)}), 500
+            log_pid.info("PID %s desactivado", zona.upper())
     return jsonify({"ok": True})
 
 
 @app.post("/api/parada")
 def api_parada():
+    log.warning("API /parada — parada de emergencia solicitada")
     apagar_salidas("Parada de emergencia desde la interfaz")
     return jsonify({"ok": True})
 
@@ -1193,8 +1267,10 @@ setInterval(refrescar, 1000);
 # ============================================================================
 
 if __name__ == "__main__":
+    log.info("Iniciando servidor de la cámara de niebla (puerto web %d)", PUERTO_WEB)
     hilo = threading.Thread(target=lazo_control, daemon=True)
     hilo.start()
+    log.info("Hilo de control PID iniciado")
     print(f"Panel de control en http://localhost:{PUERTO_WEB}")
     # threaded=True para que las peticiones no bloqueen; use_reloader=False
     # para no duplicar los hilos de control.
