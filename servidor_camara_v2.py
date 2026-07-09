@@ -317,7 +317,7 @@ class FuenteOWON:
                 log_fuente.debug("RX ← %s", self.ultima_respuesta)
                 return self.ultima_respuesta
         # Write-only: soltar el lock ANTES del sleep para no bloquear otros hilos.
-        time.sleep(0.02)
+        time.sleep(0.05)
         return None
 
     # ---- Comandos de la especificación (ODP3032.txt) ----
@@ -339,11 +339,16 @@ class FuenteOWON:
 
     def sincronizar(self):
         """SYNCHRO,0 devuelve el estado completo de la fuente.
-        Formato esperado:
-          $COMMON,{modo},{on},{cc_cv},{f3},{v_set},{i_set},{v_out},{i_out},{ovp},{ocp},   (x2)  checksum#
+        Si el dispositivo responde con $ACK,2 (ocupado), reintenta una vez
+        tras una pausa adicional.
         """
         try:
             resp = self.enviar("SYNCHRO,0", leer=True)
+            # $ACK,2,345# = dispositivo ocupado procesando comando anterior
+            if resp and resp.startswith("$ACK"):
+                log_fuente.debug("SYNCHRO recibió ACK (%s), reintentando en 300 ms", resp)
+                time.sleep(0.30)
+                resp = self.enviar("SYNCHRO,0", leer=True)
             canales = self._parsear_synchro(resp)
             if canales:
                 self.canales = canales
@@ -578,6 +583,7 @@ def _rampa(v_actual, v_deseado, dt):
 def lazo_control():
     ultimo = time.time()
     ultimo_synchro = 0.0
+    ultimo_keylock = 0.0   # para enviar KEYLOCK,0 periódicamente
     while True:
         time.sleep(PERIODO_CONTROL)
         ahora = time.time()
@@ -631,6 +637,16 @@ def lazo_control():
                 # que el dispositivo no responda con $ACK,2 (ocupado).
                 time.sleep(0.15)
                 fuente.sincronizar()
+
+            # --- KEYLOCK periódico: mantener panel frontal desbloqueado ---
+            # Algunos firmwares de OWON vuelven a REMOTE mode con el tiempo.
+            if ahora - ultimo_keylock > 30.0 and fuente.conectada:
+                ultimo_keylock = ahora
+                try:
+                    fuente.enviar("KEYLOCK,0")
+                    log_fuente.debug("KEYLOCK,0 periódico enviado")
+                except Exception as e:
+                    log_fuente.debug("KEYLOCK,0 periódico falló: %s", e)
                 # Diagnóstico: verificar estado real de la fuente
                 for canal, zona, v_cmd in [
                     (CANAL_FRIO,     "FRÍO",  estado.v_cold),
