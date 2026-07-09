@@ -281,35 +281,56 @@ class FuenteOWON:
     def _enmarcar(self, payload):
         return f"&{payload},{self._checksum(payload)}#\r\n".encode()
 
+    @staticmethod
+    def _es_timeout_usb(exc):
+        """Reconoce timeout tanto con libusb1 como con libusb0 de Windows."""
+        return (
+            isinstance(exc, usb.core.USBTimeoutError)
+            or getattr(exc, "errno", None) in (60, 110)
+            or "timeout" in str(exc).lower()
+            or "timed out" in str(exc).lower()
+        )
+
     def enviar(self, payload, leer=False):
         """Envía &payload,checksum# y opcionalmente lee la respuesta.
 
-        Incluso los comandos write-only devuelven un $ACK. Es indispensable
-        consumirlo: si se dejan ACK pendientes, el endpoint IN se llena y la
-        fuente termina aparentando estar bloqueada.
+        Los setters se envían sin esperar ACK: algunos firmwares no responden
+        y bloquearían innecesariamente el PID hasta el timeout. Antes de una
+        consulta se descartan ACK antiguos para leer su respuesta correcta.
         """
         if not self.conectada:
             raise RuntimeError("La fuente no está conectada")
         trama = self._enmarcar(payload)
         log_fuente.debug("TX → %s", trama.decode(errors="replace").strip())
         with self._lock:
+            if leer:
+                # Vaciar respuestas atrasadas de setters anteriores. El
+                # timeout corto solo indica que el endpoint ya está vacío.
+                while True:
+                    try:
+                        atrasada = self._dev.read(EP_IN, 512, timeout=10)
+                        texto = ''.join(chr(x) for x in atrasada).strip()
+                        log_fuente.debug("RX descartada ← %s", texto)
+                    except usb.core.USBError as e:
+                        if self._es_timeout_usb(e):
+                            break
+                        raise
+
             self._dev.write(EP_OUT, trama)
-            # Mantener el lock hasta asociar la respuesta con este comando.
-            time.sleep(0.12 if leer else 0.05)
-            try:
+            if leer:
+                # Mantener el lock hasta asociar la respuesta con la consulta.
+                time.sleep(0.12)
                 datos = self._dev.read(
-                    EP_IN, 512, timeout=5000 if leer else 250
+                    EP_IN, 512, timeout=5000
                 )
                 respuesta = ''.join(chr(x) for x in datos).strip()
                 self.ultima_respuesta = respuesta
                 log_fuente.debug("RX ← %s", respuesta)
-                return respuesta if leer else None
-            except usb.core.USBTimeoutError:
-                if leer:
-                    raise
-                # Algunos firmwares no confirman todos los setters.
-                log_fuente.debug("Sin ACK para %s (continuando)", payload)
-                return None
+                return respuesta
+
+        # Dar tiempo al firmware para procesar el setter sin leer un ACK.
+        time.sleep(0.05)
+        return None
 
     # ---- Comandos de la especificación (ODP3032.txt) ----
 
