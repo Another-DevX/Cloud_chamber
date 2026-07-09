@@ -106,9 +106,10 @@ CANAL_CALIENTE = 2  # Calefactor
 
 # Límites duros de la ODP3032 (30 V / 3 A por canal). Los límites "blandos"
 # se configuran desde la interfaz, pero nunca podrán superar estos.
-# NOTA: si el OVP de hardware está configurado en 5.5 V, ajustar V_MAX_HW
-# a 5.0 para que el PID no intente comandar voltajes imposibles.
-V_MAX_HW = 5.0
+# La Peltier de la zona fría tiene tensión nominal de 12 V. La protección OVP
+# de CH1 debe configurarse por encima de 12 V en la fuente; de lo contrario la
+# ODP3032 cortará la salida antes de alcanzar este límite.
+V_MAX_HW = 12.0
 I_MAX_HW = 3.0
 
 # Periodo del lazo de control (s)
@@ -496,7 +497,7 @@ class Estado:
         self.sp_hot = 30.0
 
         # PIDs y sus parámetros por zona
-        self.pid_cold = PID(kp=1.5, ki=0.05, kd=2.0, out_min=0.0, out_max=4.5)
+        self.pid_cold = PID(kp=1.5, ki=0.05, kd=2.0, out_min=0.0, out_max=12.0)
         self.pid_hot = PID(kp=1.0, ki=0.03, kd=1.0, out_min=0.0, out_max=4.5)
         self.pid_cold_on = False
         self.pid_hot_on = False
