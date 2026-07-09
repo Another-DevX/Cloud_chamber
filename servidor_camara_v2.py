@@ -628,7 +628,7 @@ def lazo_control():
             if ahora - ultimo_synchro > 10.0:
                 ultimo_synchro = ahora
                 fuente.sincronizar()
-                # Diagnóstico: verificar que la fuente aplicó los voltajes
+                # Diagnóstico: verificar estado real de la fuente
                 for canal, zona, v_cmd in [
                     (CANAL_FRIO,     "FRÍO",  estado.v_cold),
                     (CANAL_CALIENTE, "CALOR", estado.v_hot),
@@ -636,27 +636,44 @@ def lazo_control():
                     info = fuente.canales.get(canal)
                     if info is None:
                         continue
-                    # ¿Comando de voltaje ignorado?
-                    if v_cmd > 0.05 and abs(info["v_set"] - v_cmd) > 0.2:
+
+                    # 1. ¿Salida apagada? Probable disparo de OCP.
+                    if not info["on"]:
                         log_pid.warning(
-                            "DIAG CH%d %s: v_cmd=%.2fV pero fuente v_set=%.3fV "
-                            "— comando SCH%dV posiblemente ignorado",
-                            canal, zona, v_cmd, info["v_set"], canal,
+                            "DIAG CH%d %s: SALIDA APAGADA (on=0) — "
+                            "OCP=%.3fA probablemente disparado por corriente de arranque. "
+                            "Subir OCP desde el panel o probar SOCP%d,%.2f en la consola",
+                            canal, zona, info["ocp"], canal,
+                            min(I_MAX_HW, info["i_set"] or 3.0),
                         )
-                    # ¿OVP demasiado bajo para el setpoint PID?
+                        continue  # el resto de diagnósticos no aplica
+
+                    # 2. ¿On=1 pero sin salida real?
                     pid = estado.pid_cold if canal == CANAL_FRIO else estado.pid_hot
+                    if info["v_set"] > 0.1 and info["v_out"] < 0.01 and info["i_out"] < 0.001:
+                        log_pid.warning(
+                            "DIAG CH%d %s: on=1 v_set=%.3fV pero v_out=0 i_out=0 — "
+                            "OCP=%.3fA puede haber disparado al energizar. "
+                            "i_set=%.3fA. Verificar OCP en panel.",
+                            canal, zona, info["v_set"], info["ocp"], info["i_set"],
+                        )
+
+                    # 3. ¿OVP más bajo que el vmax del PID?
                     if info["ovp"] > 0 and pid.out_max > info["ovp"]:
                         log_pid.warning(
                             "DIAG CH%d %s: OVP=%.1fV < vmax_pid=%.1fV "
                             "— la fuente cortará la salida al superar la protección",
                             canal, zona, info["ovp"], pid.out_max,
                         )
-                    # ¿Modo CC cuando se esperaba CV?
-                    if info["on"] and info["cc_cv"] == 1:
+
+                    # 4. ¿v_cmd muy distinto de v_set? (solo si son del mismo ciclo)
+                    # Nota: SYNCHRO es cada 10 s; el PID cambia v_cmd cada 1 s,
+                    # por lo que una diferencia pequeña es normal.
+                    if v_cmd > 0.1 and info["v_set"] < 0.01:
                         log_pid.warning(
-                            "DIAG CH%d %s: fuente en modo CC (limitada por corriente), "
-                            "v_out=%.3fV < v_set=%.3fV — verificar límite de corriente",
-                            canal, zona, info["v_out"], info["v_set"],
+                            "DIAG CH%d %s: v_cmd=%.2fV pero fuente v_set=0 "
+                            "— SCH%dV rechazado (¿OVP=%.1fV? ¿salida OFF?)",
+                            canal, zona, v_cmd, canal, info["ovp"],
                         )
 
         except Exception as e:
@@ -1214,6 +1231,7 @@ PAGINA = r"""<!DOCTYPE html>
         <span>modo <b id="mf-modo-cold">—</b></span>
         <span>OVP <b id="mf-ovp-cold">—</b></span>
       </div>
+    </section>
 
     <section class="zona caliente">
       <h2>Zona caliente</h2>
@@ -1253,6 +1271,7 @@ PAGINA = r"""<!DOCTYPE html>
         <span>modo <b id="mf-modo-hot">—</b></span>
         <span>OVP <b id="mf-ovp-hot">—</b></span>
       </div>
+    </section>
   </div>
 
   <!-- Gráfica -->
