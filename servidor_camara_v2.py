@@ -627,6 +627,9 @@ def lazo_control():
             # --- Consulta periódica de la fuente (cruda, ver nota en driver)
             if ahora - ultimo_synchro > 10.0:
                 ultimo_synchro = ahora
+                # Esperar un mínimo de 150 ms desde el último write para
+                # que el dispositivo no responda con $ACK,2 (ocupado).
+                time.sleep(0.15)
                 fuente.sincronizar()
                 # Diagnóstico: verificar estado real de la fuente
                 for canal, zona, v_cmd in [
