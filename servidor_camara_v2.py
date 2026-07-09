@@ -106,7 +106,9 @@ CANAL_CALIENTE = 2  # Calefactor
 
 # Límites duros de la ODP3032 (30 V / 3 A por canal). Los límites "blandos"
 # se configuran desde la interfaz, pero nunca podrán superar estos.
-V_MAX_HW = 30.0
+# NOTA: si el OVP de hardware está configurado en 5.5 V, ajustar V_MAX_HW
+# a 5.0 para que el PID no intente comandar voltajes imposibles.
+V_MAX_HW = 5.0
 I_MAX_HW = 3.0
 
 # Periodo del lazo de control (s)
@@ -241,12 +243,43 @@ class FuenteOWON:
 
         self._dev = dev
         self.etiqueta = f"{dev.idVendor:04x}:{dev.idProduct:04x}"
+
+        # Reclamar la interfaz explícitamente para poder soltarla al desconectar.
+        try:
+            usb.util.claim_interface(dev, 0)
+        except usb.core.USBError as e:
+            log_fuente.debug("claim_interface: %s (puede ser normal)", e)
+
         log_fuente.info("Fuente conectada: %s (bus=%d address=%d)",
                         self.etiqueta, dev.bus, dev.address)
+
+        # Intentar desbloquear el panel frontal (REMOTE mode).
+        # La ODP3032 puede entrar en modo remoto al recibir comandos USB,
+        # lo que congela los botones físicos. KEYLOCK,0 lo libera (si el
+        # firmware lo soporta; si no, la excepción se ignora).
+        log_fuente.info("Intentando desbloquear panel frontal (KEYLOCK,0)…")
+        try:
+            self.enviar("KEYLOCK,0")
+            log_fuente.info("Panel frontal desbloqueado (KEYLOCK,0 aceptado)")
+        except Exception as e:
+            log_fuente.warning(
+                "KEYLOCK,0 no aceptado (%s) — el panel frontal puede quedar "
+                "bloqueado en REMOTE mode mientras haya conexión USB activa", e
+            )
 
     def desconectar(self):
         if self._dev is not None:
             log_fuente.info("Desconectando fuente (%s)", self.etiqueta)
+            # Intentar restaurar el control local antes de soltar el USB.
+            try:
+                self.enviar("KEYLOCK,0")
+                log_fuente.info("Panel frontal restaurado (KEYLOCK,0)")
+            except Exception:
+                pass
+            try:
+                usb.util.release_interface(self._dev, 0)
+            except Exception:
+                pass
             try:
                 usb.util.dispose_resources(self._dev)
             except Exception:
@@ -263,19 +296,28 @@ class FuenteOWON:
         return f"&{payload},{self._checksum(payload)}#\r\n".encode()
 
     def enviar(self, payload, leer=False):
-        """Envía &payload,checksum# y opcionalmente lee la respuesta."""
+        """Envía &payload,checksum# y opcionalmente lee la respuesta.
+
+        El threading.Lock se suelta antes del sleep en comandos write-only,
+        para que el lazo PID no bloquee las peticiones de la API durante
+        los ~100 ms de espera del dispositivo.
+        """
         if not self.conectada:
             raise RuntimeError("La fuente no está conectada")
         trama = self._enmarcar(payload)
         log_fuente.debug("TX → %s", trama.decode(errors="replace").strip())
         with self._lock:
             self._dev.write(EP_OUT, trama)
-            time.sleep(0.1)
             if leer:
+                # Mantener el lock durante el sleep para que otro write
+                # no corrompa nuestra respuesta pendiente.
+                time.sleep(0.12)
                 datos = self._dev.read(EP_IN, 512, timeout=5000)
                 self.ultima_respuesta = ''.join(chr(x) for x in datos).strip()
                 log_fuente.debug("RX ← %s", self.ultima_respuesta)
                 return self.ultima_respuesta
+        # Write-only: soltar el lock ANTES del sleep para no bloquear otros hilos.
+        time.sleep(0.02)
         return None
 
     # ---- Comandos de la especificación (ODP3032.txt) ----
@@ -436,8 +478,8 @@ class Estado:
         self.sp_hot = 30.0
 
         # PIDs y sus parámetros por zona
-        self.pid_cold = PID(kp=1.5, ki=0.05, kd=2.0, out_min=0.0, out_max=12.0)
-        self.pid_hot = PID(kp=1.0, ki=0.03, kd=1.0, out_min=0.0, out_max=12.0)
+        self.pid_cold = PID(kp=1.5, ki=0.05, kd=2.0, out_min=0.0, out_max=4.5)
+        self.pid_hot = PID(kp=1.0, ki=0.03, kd=1.0, out_min=0.0, out_max=4.5)
         self.pid_cold_on = False
         self.pid_hot_on = False
 
@@ -1165,7 +1207,13 @@ PAGINA = r"""<!DOCTYPE html>
         <span>σ(60 s) <b id="sigma-cold">—</b></span>
         <span>ΔT <b id="delta-cold">—</b></span>
       </div>
-    </section>
+      <div class="medidas-fuente" id="mf-cold">
+        <span>v_set <b id="mf-vset-cold">—</b></span>
+        <span>v_out <b id="mf-vout-cold">—</b></span>
+        <span>i_out <b id="mf-iout-cold">—</b></span>
+        <span>modo <b id="mf-modo-cold">—</b></span>
+        <span>OVP <b id="mf-ovp-cold">—</b></span>
+      </div>
 
     <section class="zona caliente">
       <h2>Zona caliente</h2>
@@ -1198,7 +1246,13 @@ PAGINA = r"""<!DOCTYPE html>
         <span>σ(60 s) <b id="sigma-hot">—</b></span>
         <span>ΔT <b id="delta-hot">—</b></span>
       </div>
-    </section>
+      <div class="medidas-fuente" id="mf-hot">
+        <span>v_set <b id="mf-vset-hot">—</b></span>
+        <span>v_out <b id="mf-vout-hot">—</b></span>
+        <span>i_out <b id="mf-iout-hot">—</b></span>
+        <span>modo <b id="mf-modo-hot">—</b></span>
+        <span>OVP <b id="mf-ovp-hot">—</b></span>
+      </div>
   </div>
 
   <!-- Gráfica -->
@@ -1214,6 +1268,32 @@ PAGINA = r"""<!DOCTYPE html>
     </div>
     <div class="eventos" id="eventos">Sin eventos.</div>
   </div>
+
+  <!-- Panel de logs -->
+  <div class="log-panel">
+    <div class="log-header">
+      <span>Log en tiempo real</span>
+      <button class="log-filter activo" data-lvl="">TODO</button>
+      <button class="log-filter" data-lvl="INFO">INFO+</button>
+      <button class="log-filter" data-lvl="WARNING">WARN+</button>
+      <button id="log-clear" style="margin-left:8px;font-size:11px;padding:2px 8px;
+        border-radius:4px;background:#1f2942;color:#8a96ab;border:1px solid #2a3a5a;">Limpiar</button>
+    </div>
+    <div class="log-entries" id="log-entries"><div style="padding:8px 14px;color:#5a6880">Esperando logs…</div></div>
+  </div>
+
+  <!-- Consola de comandos crudos -->
+  <details class="debug-consola">
+    <summary>Consola de comandos crudos (debug fuente)</summary>
+    <div class="debug-body">
+      <div class="fila-cmd">
+        <input type="text" id="cmd-payload" placeholder="SCH1V,5.00  ó  SYNCHRO,0">
+        <label><input type="checkbox" id="cmd-leer" checked> Leer resp.</label>
+        <button id="cmd-enviar">Enviar</button>
+      </div>
+      <div class="cmd-resp" id="cmd-resp">(respuesta aparece aquí)</div>
+    </div>
+  </details>
 
 </div>
 
@@ -1330,6 +1410,29 @@ function fmt(v, dec = 1) {
     ? "--.-" : v.toFixed(dec);
 }
 
+// ---------- Datos reales de la fuente (SYNCHRO) ----------
+const CANAL_ZONA = { cold: 1, hot: 2 };
+function pintarFuente(zona, canales) {
+  if (!canales) return;
+  const ch = canales[CANAL_ZONA[zona]];
+  if (!ch) return;
+  const modo = ch.cc_cv === 1 ? "CC" : "CV";
+  const vCmd = ultimoEstado ? ultimoEstado.zonas[zona].v : 0;
+  const desfase = Math.abs(ch.v_set - vCmd) > 0.2 && vCmd > 0.05;
+  const ovpBajo = ch.ovp > 0 && ultimoEstado &&
+        ch.ovp < ultimoEstado.zonas[zona].vmax;
+
+  $("mf-vset-" + zona).textContent = ch.v_set.toFixed(3) + " V";
+  $("mf-vset-" + zona).className = desfase ? "mf-alerta" : "";
+  $("mf-vout-" + zona).textContent = ch.v_out.toFixed(3) + " V";
+  $("mf-iout-" + zona).textContent = ch.i_out.toFixed(3) + " A";
+  $("mf-modo-" + zona).textContent = modo;
+  $("mf-modo-" + zona).className = ch.cc_cv === 1 ? "mf-alerta" : "";
+  const ovpEl = $("mf-ovp-" + zona);
+  ovpEl.textContent = ch.ovp.toFixed(1) + " V";
+  ovpEl.className = ovpBajo ? "mf-alerta" : "";
+}
+
 function pintarZona(zona, d) {
   $("t-" + zona).innerHTML = fmt(d.t, 2) + '<span class="unidad"> °C</span>';
   $("v-" + zona).textContent = d.v.toFixed(2) + " V";
@@ -1369,6 +1472,10 @@ async function refrescar() {
   pintarConexion("punto-fuente", "btn-fuente", d.fuente, d.fuente.conectada);
   pintarZona("cold", d.zonas.cold);
   pintarZona("hot", d.zonas.hot);
+  if (d.fuente.canales) {
+    pintarFuente("cold", d.fuente.canales);
+    pintarFuente("hot",  d.fuente.canales);
+  }
 
   const ev = $("eventos");
   if (d.eventos.length === 0) {
@@ -1458,6 +1565,84 @@ function dibujar(d) {
 cargarPuertos();
 refrescar();
 setInterval(refrescar, 1000);
+
+// ---------- Panel de logs ----------
+let _logFiltro = "";       // nivel mínimo: "" = todo, "INFO", "WARNING", "ERROR"
+let _logBuf = [];           // buffer local para no re-pedir todo en cada tick
+let _logPausado = false;    // true cuando el usuario hace scroll hacia arriba
+
+const NIVELES = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"];
+function nivelNum(s) { return NIVELES.indexOf(s); }
+
+const logEl = $("log-entries");
+logEl.addEventListener("scroll", () => {
+  // Si el usuario sube el scroll pausamos el auto-scroll
+  const enFondo = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 20;
+  _logPausado = !enFondo;
+});
+
+function renderLogs() {
+  const minNivel = nivelNum(_logFiltro || "DEBUG");
+  const filtrados = _logBuf.filter(e => nivelNum(e.lvl) >= minNivel);
+  logEl.innerHTML = filtrados.map(e => {
+    const hora = new Date(e.t * 1000).toLocaleTimeString();
+    return `<div class="le">
+      <span class="lt">${hora}</span>
+      <span class="ll ${e.lvl}">${e.lvl}</span>
+      <span class="ls">${e.src}</span>
+      <span class="lm">${e.msg.replace(/</g,"&lt;")}</span>
+    </div>`;
+  }).join("") || '<div style="padding:8px 14px;color:#5a6880">Sin entradas para este filtro.</div>';
+  if (!_logPausado) logEl.scrollTop = logEl.scrollHeight;
+}
+
+async function fetchLogs() {
+  try {
+    const d = await (await fetch("/api/logs?n=200")).json();
+    _logBuf = d.logs || [];
+    renderLogs();
+  } catch {}
+}
+fetchLogs();
+setInterval(fetchLogs, 2000);
+
+// Filtros
+document.querySelectorAll(".log-filter").forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll(".log-filter").forEach(b => b.classList.remove("activo"));
+    btn.classList.add("activo");
+    _logFiltro = btn.dataset.lvl;
+    _logPausado = false;
+    renderLogs();
+  };
+});
+$("log-clear").onclick = () => { _logBuf = []; renderLogs(); };
+
+// ---------- Consola de comandos crudos ----------
+$("cmd-enviar").onclick = async () => {
+  const payload = $("cmd-payload").value.trim();
+  const leer = $("cmd-leer").checked;
+  if (!payload) return;
+  const resp = $("cmd-resp");
+  resp.textContent = "enviando…";
+  resp.style.color = "#8a96ab";
+  try {
+    const d = await api("/api/cmd", { payload, leer });
+    if (d.ok) {
+      resp.textContent = d.respuesta || "(sin respuesta)";
+      resp.style.color = "#7bd88f";
+    } else {
+      resp.textContent = "ERROR: " + d.error;
+      resp.style.color = "#e86a6a";
+    }
+  } catch (e) {
+    resp.textContent = "Error de red: " + e;
+    resp.style.color = "#e86a6a";
+  }
+};
+$("cmd-payload").addEventListener("keydown", e => {
+  if (e.key === "Enter") $("cmd-enviar").click();
+});
 </script>
 </body>
 </html>
