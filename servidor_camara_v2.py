@@ -50,6 +50,36 @@ log_fuente = logging.getLogger("cloud_chamber.fuente")
 log_esp32  = logging.getLogger("cloud_chamber.esp32")
 log_pid    = logging.getLogger("cloud_chamber.pid")
 
+
+class _UILogHandler(logging.Handler):
+    """Captura entradas de log recientes para exponerlas en la interfaz web."""
+    def __init__(self, maxlen=300):
+        super().__init__()
+        self._buf = deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+        self.setFormatter(logging.Formatter("%(message)s"))
+
+    def emit(self, record):
+        try:
+            src = record.name.replace("cloud_chamber.", "").replace("cloud_chamber", "app")
+            with self._lock:
+                self._buf.appendleft({
+                    "t":   record.created,
+                    "lvl": record.levelname,
+                    "src": src,
+                    "msg": self.format(record),
+                })
+        except Exception:
+            self.handleError(record)
+
+    def entries(self, n=200):
+        with self._lock:
+            return list(self._buf)[:n]
+
+
+_ui_log = _UILogHandler(maxlen=400)
+logging.getLogger("cloud_chamber").addHandler(_ui_log)
+
 import serial                       # solo para el ESP32 (CDC/serie)
 import serial.tools.list_ports
 import usb.core                      # para la fuente OWON (USB en bruto)
@@ -168,6 +198,7 @@ class FuenteOWON:
         self._lock = threading.Lock()
         self.etiqueta = None        # "5345:1234" del dispositivo conectado
         self.ultima_respuesta = ""
+        self.canales = {}           # datos parseados del último SYNCHRO: {1: {...}, 2: {...}}
 
     @property
     def conectada(self):
@@ -265,14 +296,59 @@ class FuenteOWON:
         self.enviar(f"SCH{canal}C,{amperios:.2f}")
 
     def sincronizar(self):
-        """SYNCHRO,0 devuelve información de la fuente. El formato exacto de
-        la respuesta no está documentado en la especificación que tenemos,
-        así que por ahora solo la guardamos y la mostramos cruda en la
-        interfaz. Cuando la vean en pantalla, es fácil escribir el parser."""
+        """SYNCHRO,0 devuelve el estado completo de la fuente.
+        Formato esperado:
+          $COMMON,{modo},{on},{cc_cv},{f3},{v_set},{i_set},{v_out},{i_out},{ovp},{ocp},   (x2)  checksum#
+        """
         try:
-            return self.enviar("SYNCHRO,0", leer=True)
+            resp = self.enviar("SYNCHRO,0", leer=True)
+            canales = self._parsear_synchro(resp)
+            if canales:
+                self.canales = canales
+                for ch, c in canales.items():
+                    modo = "CC" if c["cc_cv"] else "CV"
+                    log_fuente.info(
+                        "SYNCHRO CH%d: on=%d modo=%s v_set=%.3fV v_out=%.3fV "
+                        "i_out=%.3fA ovp=%.3fV ocp=%.3fA",
+                        ch, c["on"], modo,
+                        c["v_set"], c["v_out"], c["i_out"], c["ovp"], c["ocp"],
+                    )
+            else:
+                log_fuente.warning("SYNCHRO: respuesta no parseable: %r", resp)
+            return resp
         except Exception as e:
+            log_fuente.error("SYNCHRO falló: %s", e)
             return f"error: {e}"
+
+    @staticmethod
+    def _parsear_synchro(resp):
+        """
+        Parsea: $COMMON,{modo},{f1},{f2},{f3},{v_set},{i_set},{v_out},{i_out},{ovp},{ocp},
+                              {f1},{f2},{f3},{v_set},{i_set},{v_out},{i_out},{ovp},{ocp},{checksum}#
+        9 campos por canal; devuelve {1: dict, 2: dict} o None si falla.
+        """
+        try:
+            inner = resp.lstrip("$").rstrip("#").strip()
+            p = inner.split(",")
+            # p[0]=COMMON, p[1]=modo, p[2..10]=CH1 (9 campos), p[11..19]=CH2, p[20]=checksum
+            if len(p) < 21:
+                return None
+
+            def _ch(off):
+                return {
+                    "on":    int(p[off]),
+                    "cc_cv": int(p[off + 1]),   # 0 = CV (voltaje), 1 = CC (corriente)
+                    "f3":    int(p[off + 2]),
+                    "v_set": float(p[off + 3]),
+                    "i_set": float(p[off + 4]),
+                    "v_out": float(p[off + 5]),
+                    "i_out": float(p[off + 6]),
+                    "ovp":   float(p[off + 7]),
+                    "ocp":   float(p[off + 8]),
+                }
+            return {1: _ch(2), 2: _ch(11)}
+        except Exception:
+            return None
 
 
 # ============================================================================
@@ -509,8 +585,37 @@ def lazo_control():
             # --- Consulta periódica de la fuente (cruda, ver nota en driver)
             if ahora - ultimo_synchro > 10.0:
                 ultimo_synchro = ahora
-                resp = fuente.sincronizar()
-                log_fuente.info("SYNCHRO → %s", resp)
+                fuente.sincronizar()
+                # Diagnóstico: verificar que la fuente aplicó los voltajes
+                for canal, zona, v_cmd in [
+                    (CANAL_FRIO,     "FRÍO",  estado.v_cold),
+                    (CANAL_CALIENTE, "CALOR", estado.v_hot),
+                ]:
+                    info = fuente.canales.get(canal)
+                    if info is None:
+                        continue
+                    # ¿Comando de voltaje ignorado?
+                    if v_cmd > 0.05 and abs(info["v_set"] - v_cmd) > 0.2:
+                        log_pid.warning(
+                            "DIAG CH%d %s: v_cmd=%.2fV pero fuente v_set=%.3fV "
+                            "— comando SCH%dV posiblemente ignorado",
+                            canal, zona, v_cmd, info["v_set"], canal,
+                        )
+                    # ¿OVP demasiado bajo para el setpoint PID?
+                    pid = estado.pid_cold if canal == CANAL_FRIO else estado.pid_hot
+                    if info["ovp"] > 0 and pid.out_max > info["ovp"]:
+                        log_pid.warning(
+                            "DIAG CH%d %s: OVP=%.1fV < vmax_pid=%.1fV "
+                            "— la fuente cortará la salida al superar la protección",
+                            canal, zona, info["ovp"], pid.out_max,
+                        )
+                    # ¿Modo CC cuando se esperaba CV?
+                    if info["on"] and info["cc_cv"] == 1:
+                        log_pid.warning(
+                            "DIAG CH%d %s: fuente en modo CC (limitada por corriente), "
+                            "v_out=%.3fV < v_set=%.3fV — verificar límite de corriente",
+                            canal, zona, info["v_out"], info["v_set"],
+                        )
 
         except Exception as e:
             log_pid.exception("Excepción en el lazo de control")
@@ -711,7 +816,8 @@ def api_estado():
             "esp32": {"conectado": lector.conectado, "puerto": lector.puerto,
                       "datos_frescos": (ahora - estado.t_dato) < WATCHDOG_S},
             "fuente": {"conectada": fuente.conectada, "puerto": fuente.etiqueta,
-                       "respuesta_cruda": fuente.ultima_respuesta},
+                       "respuesta_cruda": fuente.ultima_respuesta,
+                       "canales": fuente.canales},
             "zonas": {
                 "cold": {"t": estado.t_cold, "sp": estado.sp_cold,
                          "pid_on": estado.pid_cold_on, "v": estado.v_cold,
@@ -729,6 +835,32 @@ def api_estado():
             "historia": [[round(m[0], 1), m[1], m[2]] for m in hist],
             "eventos": [{"t": e[0], "msg": e[1]} for e in list(estado.eventos)],
         })
+
+
+@app.get("/api/logs")
+def api_logs():
+    """Devuelve las últimas entradas de log capturadas en memoria."""
+    n = min(int(request.args.get("n", 200)), 400)
+    return jsonify({"logs": _ui_log.entries(n)})
+
+
+@app.post("/api/cmd")
+def api_cmd():
+    """Envía un comando crudo a la fuente (para depuración)."""
+    datos = request.get_json(force=True)
+    payload = (datos.get("payload") or "").strip()
+    leer = bool(datos.get("leer", True))
+    if not payload:
+        return jsonify({"ok": False, "error": "payload vacío"}), 400
+    if not fuente.conectada:
+        return jsonify({"ok": False, "error": "Fuente no conectada"}), 400
+    log_fuente.info("CMD manual → payload=%r leer=%s", payload, leer)
+    try:
+        resp = fuente.enviar(payload, leer=leer)
+        return jsonify({"ok": True, "respuesta": resp or "(sin respuesta)"})
+    except Exception as e:
+        log_fuente.error("CMD manual falló: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.get("/")
@@ -896,6 +1028,75 @@ PAGINA = r"""<!DOCTYPE html>
   }
   .eventos div { padding: 2px 0; }
   .parada button { font-size: 15px; padding: 14px 22px; border-radius: 10px; }
+
+  /* --- Panel de logs --- */
+  .log-panel {
+    margin-top: 14px; background: var(--panel); border: 1px solid var(--panel-borde);
+    border-radius: 12px; overflow: hidden;
+  }
+  .log-header {
+    display: flex; align-items: center; gap: 8px; padding: 8px 14px;
+    background: #0d1220; border-bottom: 1px solid var(--panel-borde);
+    font-size: 12px; font-family: var(--mono);
+  }
+  .log-header span { color: var(--tenue); margin-right: auto; }
+  .log-filter {
+    padding: 2px 8px; font-size: 11px; border-radius: 4px;
+    background: #1f2942; color: var(--tenue); border: 1px solid #2a3a5a;
+  }
+  .log-filter.activo { background: #2a3a6a; color: var(--texto); border-color: #4a6aaa; }
+  .log-entries {
+    height: 220px; overflow-y: auto; font-family: var(--mono);
+    font-size: 12px; padding: 6px 0;
+  }
+  .log-entries .le {
+    padding: 1px 14px; display: grid;
+    grid-template-columns: 6.5em 4.5em 5em 1fr; gap: 6px; align-items: baseline;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+  }
+  .le:hover { background: rgba(255,255,255,0.03); }
+  .le .lt { color: #5a6880; }
+  .le .ls { color: #7090b0; }
+  .le .ll { font-weight: 600; font-size: 10px; padding: 1px 4px; border-radius: 3px; }
+  .ll.DEBUG   { color: #5a6880; }
+  .ll.INFO    { color: #7bd88f; background: rgba(123,216,143,0.08); }
+  .ll.WARNING { color: #f2c94c; background: rgba(242,201,76,0.12); }
+  .ll.ERROR, .ll.CRITICAL { color: #e86a6a; background: rgba(232,106,106,0.12); }
+  .le .lm { color: var(--texto); white-space: pre-wrap; word-break: break-all; }
+
+  /* --- Consola de comandos crudos --- */
+  .debug-consola {
+    margin-top: 14px; background: var(--panel); border: 1px solid var(--panel-borde);
+    border-radius: 12px; padding: 0;
+  }
+  .debug-consola summary {
+    padding: 10px 16px; cursor: pointer; font-size: 12.5px; color: var(--tenue);
+    font-family: var(--mono); user-select: none; list-style: none;
+  }
+  .debug-consola summary::before { content: "▶  "; font-size: 10px; }
+  .debug-consola[open] summary::before { content: "▼  "; }
+  .debug-consola .debug-body { padding: 0 16px 14px; display: flex; flex-direction: column; gap: 8px; }
+  .debug-consola .fila-cmd { display: flex; gap: 8px; align-items: center; }
+  .debug-consola input[type=text] {
+    flex: 1; background: #0d1220; border: 1px solid var(--panel-borde);
+    color: var(--texto); border-radius: 6px; padding: 6px 10px;
+    font-family: var(--mono); font-size: 13px;
+  }
+  .debug-consola label { font-size: 12px; color: var(--tenue); white-space: nowrap; }
+  .cmd-resp {
+    background: #0d1220; border: 1px solid var(--panel-borde); border-radius: 6px;
+    padding: 8px 12px; font-family: var(--mono); font-size: 12px; color: #7bd88f;
+    min-height: 2em; white-space: pre-wrap; word-break: break-all;
+  }
+
+  /* --- Medidas reales de la fuente en las zonas --- */
+  .medidas-fuente {
+    display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 6px;
+    padding: 6px 10px; background: rgba(0,0,0,0.2); border-radius: 8px;
+    font-size: 12px; font-family: var(--mono); color: var(--tenue);
+  }
+  .medidas-fuente b { font-weight: 600; }
+  .medidas-fuente .mf-alerta { color: var(--alerta); }
 
   @media (max-width: 860px) {
     .zonas, .conexiones { grid-template-columns: 1fr; }
