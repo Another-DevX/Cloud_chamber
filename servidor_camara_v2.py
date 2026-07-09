@@ -395,9 +395,8 @@ class FuenteOWON:
 
             def _ch(off):
                 return {
-                    # En SYNCHRO usa la misma lógica invertida que SW:
-                    # 0 = salida activa, 1 = salida desactivada.
-                    "on":    int(p[off]) == 0,
+                    # SYNCHRO reporta 1 cuando la salida está activa.
+                    "on":    int(p[off]) == 1,
                     "cc_cv": int(p[off + 1]),   # 0 = CV (voltaje), 1 = CC (corriente)
                     "f3":    int(p[off + 2]),
                     "v_set": float(p[off + 3]),
